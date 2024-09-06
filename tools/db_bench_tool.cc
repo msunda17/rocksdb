@@ -137,6 +137,7 @@ DEFINE_string(
     "readwhilemerging,"
     "readwhilescanning,"
     "readrandomwriterandom,"
+    "delete_bench",
     "updaterandom,"
     "xorupdaterandom,"
     "approximatesizerandom,"
@@ -176,6 +177,7 @@ DEFINE_string(
     " async mode\n"
     "\tdeleteseq     -- delete N keys in sequential order\n"
     "\tdeleterandom  -- delete N keys in random order\n"
+    "\tdelete_bench  -- delete key after random number of writes for each key"
     "\treadseq       -- read N times sequentially\n"
     "\treadtocache   -- 1 thread reading database sequentially\n"
     "\treadreverse   -- read N times in reverse order\n"
@@ -3637,6 +3639,9 @@ class Benchmark {
         method = &Benchmark::DeleteSeq;
       } else if (name == "deleterandom") {
         method = &Benchmark::DeleteRandom;
+      } else if (name == "delete_bench") {
+        method = &Benchmark::WriteAndDelete;
+      }
       } else if (name == "readwhilewriting") {
         num_threads++;  // Add extra thread for writing
         method = &Benchmark::ReadWhileWriting;
@@ -5053,6 +5058,82 @@ class Benchmark {
 
   void WriteUniqueRandom(ThreadState* thread) {
     DoWrite(thread, UNIQUE_RANDOM);
+  }
+
+  void Benchmark::WriteAndDelete(ThreadState* thread) {
+    DoWriteAndDelete(thread, false);
+  }
+
+  void Benchmark::DoWriteAndDelete(ThreadState* thread, bool seq) {
+    if (num_ != FLAGS_num) {
+      char msg[100];
+      snprintf(msg, sizeof(msg), "(%d ops)", num_);
+      thread->stats.AddMessage(msg);
+    }
+
+    RandomGenerator gen;
+    WriteBatch batch;
+    Status s;
+    int64_t bytes = 0;
+    int64_t written = 0;
+    int64_t deleted = 0;
+    std::unordered_map<std::string, int> delete_counters;
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+    std::unique_ptr<const char[]> value_guard;
+    Slice value = AllocateValue(&value_guard);
+
+    Duration duration(FLAGS_duration, num_);
+    while (!duration.Done(written)) {
+      if (FLAGS_benchmark_write_rate_limit > 0) {
+        write_rate_limiter_->Request(value_size_ + key_size_, Env::IO_HIGH,
+                                    nullptr /* stats */);
+      }
+
+      batch.Clear();
+      int64_t batch_bytes = 0;
+
+      for (int i = 0; i < entries_per_batch_; i++) {
+        const int k = seq ? written : thread->rand.Next() % FLAGS_num;
+        GenerateKeyFromInt(k, FLAGS_num, &key);
+        value = gen.Generate();
+        batch.Put(key, value);
+
+        batch_bytes += value.size() + key.size();
+        bytes += value.size() + key.size();
+        written++;
+
+        // Generate a random delete counter for this key
+        int delete_counter = thread->rand.Next() % 1000 + 1;
+        delete_counters[key.ToString()] = delete_counter;
+
+        // Check if any keys need to be deleted
+        for (auto it = delete_counters.begin(); it != delete_counters.end();) {
+          it->second--;
+          if (it->second <= 0) {
+            batch.Delete(it->first);
+            deleted++;
+            it = delete_counters.erase(it);
+          } else {
+            ++it;
+          }
+        }
+
+        thread->stats.FinishedOps(nullptr, nullptr, 1, kWrite);
+      }
+
+      s = db_->Write(write_options_, &batch);
+      if (!s.ok()) {
+        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+        exit(1);
+      }
+    }
+
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( %ld of %ld found)", deleted, written);
+    thread->stats.AddMessage(msg);
+    thread->stats.AddBytes(bytes);
   }
 
   class KeyGenerator {

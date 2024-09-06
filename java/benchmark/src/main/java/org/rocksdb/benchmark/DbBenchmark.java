@@ -32,6 +32,7 @@ import java.nio.file.Files;
 import java.util.Collection;
 import java.util.Date;
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -45,6 +46,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import org.rocksdb.*;
 import org.rocksdb.RocksMemEnv;
+import org.rocksdb.benchmark.DbBenchmark.DeleteKeyAfterNumWritesTask;
 import org.rocksdb.util.SizeUnit;
 
 class Stats {
@@ -385,6 +387,61 @@ public class DbBenchmark {
     long[] keyBuffer_;
   }
 
+  class WriteAndDeleteTask extends WriteTask {
+    private final Random random;
+    private final Map<String, Integer> deleteCounters;
+    private final int maxDeleteAfterOps = 1000; // Maximum number of operations before a key is deleted
+
+    public WriteAndDeleteTask(int tid, long randSeed, long numEntries, long keyRange, WriteOptions writeOpt, long entriesPerBatch) {
+        super(tid, randSeed, numEntries, keyRange, writeOpt, entriesPerBatch);
+        this.random = new Random(randSeed + tid * 1000);
+        this.deleteCounters = new HashMap<>();
+    }
+
+    @Override
+    public void runTask() throws RocksDBException {
+        byte[] key = new byte[keySize_];
+        byte[] value = new byte[valueSize_];
+
+        for (long i = 0; i < numEntries_; ++i) {
+            getRandomKey(key, keyRange_);
+            DbBenchmark.this.gen_.generate(value);
+            String keyStr = new String(key);
+            db_.write(key, value);
+            stats_.finishedSingleOp(keySize_ + valueSize_);
+
+            // Set a delete counter for the key
+            int deleteAfterOps = random.nextInt(maxDeleteAfterOps) + 1;
+            deleteCounters.put(keyStr, deleteAfterOps);
+
+            // Check and delete keys
+            deleteCounters.entrySet().removeIf(entry -> {
+                int remainingOps = entry.getValue() - 1;
+                if (remainingOps <= 0) {
+                    try {
+                        db_.delete(entry.getKey().getBytes());
+                    } catch (RocksDBException e) {
+                        e.printStackTrace();
+                    }
+                    return true;
+                } else {
+                    entry.setValue(remainingOps);
+                    return false;
+                }
+            });
+
+            if (isFinished()) {
+                return;
+            }
+        }
+    }
+
+    @Override
+    protected void getKey(byte[] key, long id, long range) {
+        getRandomKey(key, range);
+    }
+}
+
   class ReadRandomTask extends BenchmarkTask {
     public ReadRandomTask(
         int tid, long randSeed, long numEntries, long keyRange) {
@@ -688,6 +745,9 @@ public class DbBenchmark {
                 currentTaskId++, randSeed_, reads_ / threadNum_, num_ / 100));
           }
           break;
+        case "delete_bench":
+          tasks.add(new WriteAndDeleteTask(currentTaskId++, randSeed_, num_, num_, writeOpt, 1));
+          break;      
         case "delete":
           destroyDb();
           open(options);
